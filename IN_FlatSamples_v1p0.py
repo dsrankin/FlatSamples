@@ -29,6 +29,9 @@ eventDataLength = 10
 
 decayTypeColumn = -1
 
+# Index of the feature used to identify padded particles (zero-padded pt)
+maskFeatureColumn = 0
+
 trainingDataLength = int(len(totalData)*0.8)
 
 validationDataLength = int(len(totalData)*0.1)
@@ -66,6 +69,20 @@ particleTestData = np.transpose(particleData[trainingDataLength + validationData
     len(particleData) - trainingDataLength - validationDataLength, entriesPerParticle, particlesConsidered),
                                 axes=(0, 2, 1))
 testLabels = np.array(labels[trainingDataLength + validationDataLength:])
+
+# Appends the particle mask as an additional feature (1 = valid particle, 0 = invalid/padded particle)
+
+
+def addMask(tensor):
+    mask = np.float32(tensor[:, :, maskFeatureColumn:maskFeatureColumn + 1] != 0)
+    return np.concatenate((tensor, mask), axis=2)
+
+
+particleTrainingData = addMask(particleTrainingData)
+particleValidationData = addMask(particleValidationData)
+particleTestData = addMask(particleTestData)
+
+entriesPerParticleWithMask = entriesPerParticle + 1
 
 # Defines the interaction matrices
 
@@ -106,7 +123,10 @@ RS = np.transpose(RST)
 # Creates and trains the neural net
 
 # Particle data interaction NN
-inputParticle = Input(shape=(particlesConsidered, entriesPerParticle), name="inputParticle")
+inputParticle = Input(shape=(particlesConsidered, entriesPerParticleWithMask), name="inputParticle")
+
+# Particle mask is the last feature of the input
+particleMask = Lambda(lambda tensor: tensor[:, :, -1:], name="particleMask")(inputParticle)
 
 XdotRR = Lambda(lambda tensor: tf.transpose(tf.tensordot(tf.transpose(tensor, perm=(0, 2, 1)), RR, axes=[[2], [0]]),
                                             perm=(0, 2, 1)), name="XdotRR")(inputParticle)
@@ -114,11 +134,18 @@ XdotRS = Lambda(lambda tensor: tf.transpose(tf.tensordot(tf.transpose(tensor, pe
                                             perm=(0, 2, 1)), name="XdotRS")(inputParticle)
 Bpp = Lambda(lambda tensorList: tf.concat((tensorList[0], tensorList[1]), axis=2), name="Bpp")([XdotRR, XdotRS])
 
+# Edge mask is 1 only if both the receiving and sending particles are valid
+edgeMask = Lambda(lambda tensorList: tensorList[0][:, :, -1:] * tensorList[1][:, :, -1:], name="edgeMask")(
+    [XdotRR, XdotRS])
+
 convOneParticle = Conv1D(80, kernel_size=1, activation="relu", name="convOneParticle")(Bpp)
 convTwoParticle = Conv1D(50, kernel_size=1, activation="relu", name="convTwoParticle")(convOneParticle)
 convThreeParticle = Conv1D(30, kernel_size=1, activation="relu", name="convThreeParticle")(convTwoParticle)
 
-Epp = BatchNormalization(momentum=0.6, name="Epp")(convThreeParticle)
+normParticle = BatchNormalization(momentum=0.6, name="normParticle")(convThreeParticle)
+
+# Removes edges involving invalid particles before aggregation
+Epp = Lambda(lambda tensorList: tensorList[0] * tensorList[1], name="Epp")([normParticle, edgeMask])
 
 # Combined prediction NN
 EppBar = Lambda(lambda tensor: tf.transpose(tf.tensordot(tf.transpose(tensor, perm=(0, 2, 1)), RRT, axes=[[2], [0]]),
@@ -129,7 +156,10 @@ C = Lambda(lambda listOfTensors: tf.concat((listOfTensors[0], listOfTensors[1]),
 convPredictOne = Conv1D(80, kernel_size=1, activation="relu", name="convPredictOne")(C)
 convPredictTwo = Conv1D(50, kernel_size=1, activation="relu", name="convPredictTwo")(convPredictOne)
 
-O = Conv1D(24, kernel_size=1, activation="relu", name="O")(convPredictTwo)
+convPredictThree = Conv1D(24, kernel_size=1, activation="relu", name="convPredictThree")(convPredictTwo)
+
+# Removes invalid particles before summing over particles
+O = Lambda(lambda tensorList: tensorList[0] * tensorList[1], name="O")([convPredictThree, particleMask])
 
 # Calculate output
 OBar = Lambda(lambda tensor: K.sum(tensor, axis=1), name="OBar")(O)
